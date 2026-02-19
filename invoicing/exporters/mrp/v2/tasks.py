@@ -56,7 +56,14 @@ def send_invoices_to_mrp(export_id, manager_class):
         # MRP autonomous mode handles only one invoice per request
         # Process each invoice separately and collect results
         for output in exporter.get_outputs_per_item():
-            result = _send_request_per_invoice_item(output['invoice'], output['xml_string'], export, api_url)
+            invoice = output['invoice']
+
+            if 'error' in output:
+                result = _record_validation_failure(invoice, output['error'], export, exporter)
+                results.append(result)
+                continue
+
+            result = _send_request_per_invoice_item(invoice, output['xml_string'], export, api_url)
             results.append(result)
 
     except Exception as e:
@@ -113,7 +120,7 @@ def _send_request_per_invoice_item(invoice, xml_string, export, api_url):
         error_info = _extract_xml_errors(response_xml, request_id)
         if error_info:
             logger.error(f"Invoice {invoice.number} failed: Request ID: {request_id} - {error_info['error']}")
-            export_result, export_detail, result = _handle_error(
+            export_result, export_detail, result = _build_failure(
                 invoice.number,
                 request_id,
                 error_info['error'],
@@ -134,13 +141,13 @@ def _send_request_per_invoice_item(invoice, xml_string, export, api_url):
     except requests.exceptions.Timeout as e:
         logger.error(f"Timeout when sending invoice {invoice.number}: {e}")
         timeout_msg = f'Request timeout: The MRP server did not respond within {InvoiceMrpListExporterMixin.request_timeout} seconds'
-        export_result, export_detail, result = _handle_error(invoice.number, request_id, timeout_msg)
+        export_result, export_detail, result = _build_failure(invoice.number, request_id, timeout_msg)
     except requests.exceptions.RequestException as e:
         logger.error(f"Request error when sending invoice {invoice.number}: {e}")
-        export_result, export_detail, result = _handle_error(invoice.number, request_id, f'Network error: {str(e)}')
+        export_result, export_detail, result = _build_failure(invoice.number, request_id, f'Network error: {str(e)}')
     except Exception as e:
         logger.exception(f"Unexpected error when sending invoice {invoice.number}: {e}")
-        export_result, export_detail, result = _handle_error(invoice.number, request_id, f'Unexpected error: {str(e)}')
+        export_result, export_detail, result = _build_failure(invoice.number, request_id, f'Unexpected error: {str(e)}')
     finally:
         # Send signal once at the end
         export_item_changed.send(
@@ -223,32 +230,44 @@ def _send_mail_with_summary(user, results, fatal_error=None):
         message.send(fail_silently=False)
 
 
-def _error_result(invoice_number, request_id, error_message, error_code=None, error_class=None):
-    """Helper method to create error result dictionary."""
+def _record_validation_failure(invoice, error_msg, export, exporter):
+    """
+    Record an invoice that failed XML generation/validation.
+
+    Fires the export_item_changed signal and returns an error result dict
+    for inclusion in the email summary.
+    """
+    logger.error(f"Skipping invoice {invoice.number}: {error_msg}")
+    export_item_changed.send(
+        sender=exporter,
+        export_id=export.id,
+        content_type=export.content_type,
+        object_id=invoice.id,
+        result=ExportItem.RESULT_FAILURE,
+        detail=error_msg,
+    )
+    _, _, result = _build_failure(invoice.number, None, error_msg)
+    return result
+
+
+def _build_failure(invoice_number, request_id, error_message, error_code=None, error_class=None):
+    """
+    Build a failure tuple for a failed invoice export.
+
+    Returns:
+        tuple: (export_result, export_detail, result_dict)
+    """
     result = {
         'invoice_number': str(invoice_number),
         'request_id': request_id,
         'status': 'error',
-        'error': str(error_message)
+        'error': str(error_message),
     }
     if error_code is not None:
         result['error_code'] = str(error_code)
     if error_class is not None:
         result['error_class'] = str(error_class)
-    return result
-
-
-def _handle_error(invoice_number, request_id, error_message, error_code=None, error_class=None):
-    """
-    Helper function to set up error state consistently.
-    
-    Returns:
-        tuple: (export_result, export_detail, result_dict)
-    """
-    export_result = ExportItem.RESULT_FAILURE
-    export_detail = str(error_message)
-    result = _error_result(invoice_number, request_id, error_message, error_code, error_class)
-    return export_result, export_detail, result
+    return ExportItem.RESULT_FAILURE, str(error_message), result
 
 
 def _extract_xml_errors(response_xml, request_id):
