@@ -9,7 +9,7 @@ Pipeline under test
 
   manager.export_*(request, queryset=N)
     ├─ email-delivery path (_execute_export)
-    │    └→ outputs.usecases.execute_export(exporter)
+    │    └→ outputs.jobs.serialize_exporter_params → execute_export.delay(...)
     │         → exporter.save_export()             (creates Export row)
     │           → ExportItem.objects.bulk_create() (N ExportItem rows)
     │         → Export.send_mail()                 (mocked — no SMTP)
@@ -56,6 +56,36 @@ def _make_request(user=None, user_id=1):
     return request
 
 
+def _orm_kwargs_from_serialized_job_params(ep):
+    """
+    Integration tests only: rebuild ORM kwargs that ``serialize_exporter_params``
+    (django-outputs) strips out before ``execute_export`` runs.
+    """
+    from django.apps import apps
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    strip = frozenset({"user_id", "recipient_ids", "queryset_ids", "queryset_model"})
+    out = {k: v for k, v in ep.items() if k not in strip}
+
+    user_id = ep.get("user_id")
+    if user_id is not None:
+        out["user"] = User.objects.get(pk=user_id)
+
+    if "recipient_ids" in ep:
+        ids = list(ep["recipient_ids"])
+        users = {u.pk: u for u in User.objects.filter(pk__in=ids)}
+        out["recipients"] = [users[pk] for pk in ids if pk in users]
+
+    q_ids = ep.get("queryset_ids")
+    q_model = ep.get("queryset_model")
+    if q_ids is not None and q_model is not None:
+        app_label, _, model_name = str(q_model).partition(".")
+        Model = apps.get_model(app_label, model_name)
+        out["queryset"] = Model.objects.filter(pk__in=list(q_ids))
+    return out
+
+
 # (db_count, selected_count) — (5, 3) is the key regression guard
 SELECTION_SCENARIOS = [
     pytest.param(1, 1, id="select_1_of_1"),
@@ -74,10 +104,9 @@ class TestInvoiceManagerExecuteExport:
     """
     Direct unit test for InvoiceManagerMixin._execute_export().
 
-    Patches outputs.usecases.execute_export to intercept the exporter
-    just before any DB work starts, and reads the queryset count there.
-    This tests the _execute_export plumbing itself without touching
-    Export or ExportItem tables.
+    Patches ``pragmatic.utils.dispatch_task`` and checks
+    ``serialize_exporter_params`` output: ``queryset_ids`` / ``queryset_model``
+    match the selected invoices (the worker deserializes in django-outputs).
     """
 
     def test_execute_export_passes_queryset_to_exporter(self, invoice_factory):
@@ -87,6 +116,8 @@ class TestInvoiceManagerExecuteExport:
         """
         all_inv = [invoice_factory() for _ in range(5)]
         queryset = Invoice.objects.filter(id__in=[i.id for i in all_inv[:3]])
+        expected_ids = sorted(i.id for i in all_inv[:3])
+        expected_model = f"{Invoice._meta.app_label}.{Invoice._meta.model_name}"
 
         class DummyManager(InvoiceManagerMixin):
             pass
@@ -95,24 +126,21 @@ class TestInvoiceManagerExecuteExport:
         request = _make_request()
 
         captured = {}
-        usecases = sys.modules["outputs.usecases"]
-        original = usecases.execute_export
 
-        def _capturing(exporter, language=None):
-            captured["count"] = exporter.get_queryset().count()
+        def _capturing_dispatch(_task, exporter_class, job_params, language=None):
+            captured["queryset_ids"] = sorted(job_params.get("queryset_ids") or [])
+            captured["queryset_model"] = job_params.get("queryset_model")
 
-        usecases.execute_export = _capturing
-        try:
+        with patch("pragmatic.utils.dispatch_task", side_effect=_capturing_dispatch):
             manager._execute_export(
                 request=request,
                 exporter_class=sys.modules["outputs.mixins"].ExporterMixin,
                 exporter_params={"user": request.user, "recipients": [request.user], "params": {}},
                 queryset=queryset,
             )
-        finally:
-            usecases.execute_export = original
 
-        assert captured["count"] == 3
+        assert captured["queryset_ids"] == expected_ids
+        assert captured["queryset_model"] == expected_model
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +179,16 @@ class TestRealExportItemCreation:
     @staticmethod
     def _email_export(manager, exporter_class, queryset, user):
         """Run an email-delivery export and return the ExportItem count."""
+        from outputs.jobs import execute_export as outputs_execute_export
         from outputs.models import ExportItem
+
         request = _make_request(user=user)
-        with patch('outputs.models.Export.send_mail'):
+        with patch("outputs.models.Export.send_mail"), patch(
+            "pragmatic.utils.dispatch_task",
+            side_effect=lambda task, ec, ep, language=None: outputs_execute_export(
+                ec, _orm_kwargs_from_serialized_job_params(ep), language
+            ),
+        ):
             manager._execute_export(
                 request=request,
                 exporter_class=exporter_class,
