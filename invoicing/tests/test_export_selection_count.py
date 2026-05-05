@@ -56,34 +56,7 @@ def _make_request(user=None, user_id=1):
     return request
 
 
-def _orm_kwargs_from_serialized_job_params(ep):
-    """
-    Integration tests only: rebuild ORM kwargs that ``serialize_exporter_params``
-    (django-outputs) strips out before ``execute_export`` runs.
-    """
-    from django.apps import apps
-    from django.contrib.auth import get_user_model
 
-    User = get_user_model()
-    strip = frozenset({"user_id", "recipient_ids", "queryset_ids", "queryset_model"})
-    out = {k: v for k, v in ep.items() if k not in strip}
-
-    user_id = ep.get("user_id")
-    if user_id is not None:
-        out["user"] = User.objects.get(pk=user_id)
-
-    if "recipient_ids" in ep:
-        ids = list(ep["recipient_ids"])
-        users = {u.pk: u for u in User.objects.filter(pk__in=ids)}
-        out["recipients"] = [users[pk] for pk in ids if pk in users]
-
-    q_ids = ep.get("queryset_ids")
-    q_model = ep.get("queryset_model")
-    if q_ids is not None and q_model is not None:
-        app_label, _, model_name = str(q_model).partition(".")
-        Model = apps.get_model(app_label, model_name)
-        out["queryset"] = Model.objects.filter(pk__in=list(q_ids))
-    return out
 
 
 # (db_count, selected_count) — (5, 3) is the key regression guard
@@ -186,7 +159,7 @@ class TestRealExportItemCreation:
         with patch("outputs.models.Export.send_mail"), patch(
             "pragmatic.utils.dispatch_task",
             side_effect=lambda task, ec, ep, language=None: outputs_execute_export(
-                ec, _orm_kwargs_from_serialized_job_params(ep), language
+                ec, ep, language
             ),
         ):
             manager._execute_export(
