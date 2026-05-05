@@ -109,7 +109,6 @@ class InvoiceManagerMixin(object):
         from outputs.utils import serialize_exporter_params
         from pragmatic.utils import dispatch_task
 
-        exporter_params = {**exporter_params, 'queryset': exporter.queryset}
         dispatch_task(
             execute_export,
             exporter_class,
